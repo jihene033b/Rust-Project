@@ -1,0 +1,17 @@
+[package]
+name = "main_orchestrator"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# Importation des outils locaux (tes crates)
+network_scanner = { path = "../network_scanner" }
+http_fuzzer = { path = "../http_fuzzer" }
+cve_scanner = { path = "../cve_scanner" }
+
+# Utilisation des dépendances communes définies à la racine
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+reqwest = { workspace = true }
+anyhow = { workspace = true }
