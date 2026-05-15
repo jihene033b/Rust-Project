@@ -1,14 +1,8 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
+pub mod models;
+pub mod data;
+pub mod loader;
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
-}
+// Re-export les types principaux pour faciliter l'utilisation
+pub use models::{Service, Vulnerability, ServiceList, ScanReport};
+pub use loader::{load_services_from_file, load_services_from_json};
+pub use data::get_cve_database;
