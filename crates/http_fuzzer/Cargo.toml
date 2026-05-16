@@ -10,3 +10,4 @@ serde = { workspace = true }
 # Ajoute cette ligne spécifiquement pour la gestion des arguments CLI
 clap = { version = "4.4", features = ["derive"] }
 anyhow = { workspace = true } # <-- AJOUTE CETTE LIGNE
+serde_json = { workspace = true }
