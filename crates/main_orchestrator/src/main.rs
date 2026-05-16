@@ -1,10 +1,8 @@
-// fn main() {
-//     println!("Hello, world!");
-// }
-// On importe la structure que tu viens de créer dans ta crate http_fuzzer
 use http_fuzzer::{FuzzerArgs, run_fuzzer};
 
-#[tokio::main] // Obligatoire pour exécuter du code asynchrone avec Tokio
+
+// ######## FONCTION MAIN POUR TESTER LE FUZZER ############
+#[tokio::main] 
 async fn main() -> Result<(), anyhow::Error> {
     // 1. Analyse les arguments passés au terminal
     let args = FuzzerArgs::parse_cli();
