@@ -1,11 +1,10 @@
-
 use clap::Parser;
 use std::path::PathBuf;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use reqwest::Client;
-use std::sync::{Arc, Mutex}; // Ajout de Mutex ici
-use std::collections::HashSet; // Ajout de HashSet pour l'unicité
+use std::sync::{Arc, Mutex};
+use std::collections::HashSet;
 use tokio::sync::Semaphore;
 
 #[derive(Parser, Debug, Clone)]
@@ -26,6 +25,10 @@ pub struct FuzzerArgs {
     #[arg(short, long, default_value = "200,204,301,302,307,401,403")]
     pub status_codes: String,
 
+    /// Extensions de fichiers à tester (ex: php,txt,html)
+    #[arg(short = 'x', long)]
+    pub extensions: Option<String>,
+
     #[arg(short = 'a', long, default_value = "Mozilla/5.0 (Gobuster-RS)")]
     pub user_agent: String,
 
@@ -43,6 +46,18 @@ impl FuzzerArgs {
             .split(',')
             .filter_map(|s| s.trim().parse::<u16>().ok())
             .collect()
+    }
+
+    /// Analyse la chaîne des extensions pour renvoyer un vecteur propre (ex: ["php", "txt"])
+    pub fn get_extensions(&self) -> Vec<String> {
+        match &self.extensions {
+            Some(exts) => exts
+                .split(',')
+                .map(|s| s.trim().trim_start_matches('.').to_string()) // Nettoie si l'utilisateur écrit ".php" au lieu de "php"
+                .filter(|s| !s.is_empty())
+                .collect(),
+            None => vec![],
+        }
     }
 }
 
@@ -63,7 +78,18 @@ pub fn read_wordlist(path: &std::path::Path) -> Result<Vec<String>, std::io::Err
 pub async fn run_fuzzer(args: FuzzerArgs) -> Result<(), anyhow::Error> {
     println!("[+] Chargement de la wordlist...");
     let words = read_wordlist(&args.wordlist)?;
-    println!("[+] {} mots chargés. Initialisation du scan...", words.len());
+    
+    // Récupération et nettoyage des extensions
+    let extensions = args.get_extensions();
+    
+    // Calcul du nombre total de requêtes théoriques
+    let total_requests = words.len() * (1 + extensions.len());
+    println!("[+] {} mots chargés (Extensions configurées : {}). Total estimé : {} requêtes.", 
+        words.len(), 
+        if extensions.is_empty() { "Aucune".to_string() } else { args.extensions.clone().unwrap() },
+        total_requests
+    );
+    println!("[+] Initialisation du scan...");
 
     let timeout_duration = std::time::Duration::from_secs(5);
 
@@ -76,55 +102,60 @@ pub async fn run_fuzzer(args: FuzzerArgs) -> Result<(), anyhow::Error> {
     let client = Arc::new(client);
     let args = Arc::new(args);
     let allowed_statuses = Arc::new(args.get_status_codes());
-
-    // Initialisation du HashSet sécurisé pour stocker les serveurs uniques
     let discovered_servers = Arc::new(Mutex::new(HashSet::new()));
 
     let semaphore = Arc::new(Semaphore::new(args.threads));
     let mut tasks = vec![];
 
     for word in words {
-        let client = Arc::clone(&client);
-        let args = Arc::clone(&args);
-        let allowed_statuses = Arc::clone(&allowed_statuses);
-        let permit = Arc::clone(&semaphore).acquire_owned().await?;
-        
-        // On clone la référence du HashSet pour l'envoyer dans la tâche
-        let discovered_servers = Arc::clone(&discovered_servers);
+        // Pour chaque mot, on génère la liste des patterns à tester (le mot brut + le mot avec extensions)
+        let mut payloads = vec![word.clone()];
+        for ext in &extensions {
+            payloads.push(format!("{}.{}", word, ext));
+        }
 
-        let base_url = args.url.trim_end_matches('/');
-        let target_url = format!("{}/{}", base_url, word);
+        // On boucle sur tous les payloads générés pour ce mot précis
+        for payload in payloads {
+            let client = Arc::clone(&client);
+            let args = Arc::clone(&args);
+            let allowed_statuses = Arc::clone(&allowed_statuses);
+            let discovered_servers = Arc::clone(&discovered_servers);
+            let permit = Arc::clone(&semaphore).acquire_owned().await?;
 
-        let task = tokio::spawn(async move {
-            match client.get(&target_url).send().await {
-                Ok(response) => {
-                    let status = response.status().as_u16();
-                    if allowed_statuses.contains(&status) {
-                        let server_header = response
-                            .headers()
-                            .get("server")
-                            .and_then(|h| h.to_str().ok())
-                            .unwrap_or("Inconnu")
-                            .to_string();
+            let base_url = args.url.trim_end_matches('/');
+            let target_url = format!("{}/{}", base_url, payload);
+            let payload_clone = payload.clone();
 
-                        println!(" -> /{} (Status: {}) [Server: {}]", word, status, server_header);
+            let task = tokio::spawn(async move {
+                match client.get(&target_url).send().await {
+                    Ok(response) => {
+                        let status = response.status().as_u16();
+                        if allowed_statuses.contains(&status) {
+                            let server_header = response
+                                .headers()
+                                .get("server")
+                                .and_then(|h| h.to_str().ok())
+                                .unwrap_or("Inconnu")
+                                .to_string();
 
-                        // On verrouille le Mutex pour insérer le serveur trouvé en toute sécurité
-                        if let Ok(mut servers) = discovered_servers.lock() {
-                            servers.insert(server_header);
+                            println!(" -> /{} (Status: {}) [Server: {}]", payload_clone, status, server_header);
+
+                            if let Ok(mut servers) = discovered_servers.lock() {
+                                servers.insert(server_header);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        if args.verbose {
+                            println!("[!] Erreur sur : /{} -> {}", payload_clone, e);
                         }
                     }
                 }
-                Err(e) => {
-                    if args.verbose {
-                        println!("[!] Erreur sur : /{} -> {}", word, e);
-                    }
-                }
-            }
-            drop(permit);
-        });
+                drop(permit);
+            });
 
-        tasks.push(task);
+            tasks.push(task);
+        }
     }
 
     for task in tasks {
@@ -133,7 +164,6 @@ pub async fn run_fuzzer(args: FuzzerArgs) -> Result<(), anyhow::Error> {
 
     println!("[+] Fuzzing terminé.");
 
-    // --- AFFICHAGE DE LA SYNTHÈSE FINALE ---
     println!("\n--- [ Technologies Web Découvertes ] ---");
     if let Ok(servers) = discovered_servers.lock() {
         if servers.is_empty() {
