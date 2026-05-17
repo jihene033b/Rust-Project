@@ -1,4 +1,5 @@
 [workspace]
+resolver = "3"
 members = [
     "crates/network_scanner",
     "crates/http_fuzzer",
@@ -8,12 +9,13 @@ members = [
 
 [workspace.package]
 version = "0.1.0"
-edition = "2021"
-authors = ["Quentin GUILLAUME & Team"]
+edition = "2024"
+authors = ["Equipe-2"]
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.11", features = ["json"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-anyhow = "1.0" # Pour une gestion d'erreurs simplifiée 
+anyhow = "1.0"
+clap = { version = "4.4", features = ["derive"] }
