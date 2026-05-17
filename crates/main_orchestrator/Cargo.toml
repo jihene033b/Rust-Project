@@ -11,6 +11,7 @@ cve_scanner = { path = "../cve_scanner" }
 
 # Utilisation des dépendances communes définies à la racine
 tokio = { workspace = true }
+clap = { version = "4", features = ["derive"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 reqwest = { workspace = true }
