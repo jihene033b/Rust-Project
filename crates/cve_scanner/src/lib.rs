@@ -1,14 +1,19 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
+pub mod models;
+pub mod data;
+pub mod loader;
+pub mod scanner;
+pub mod nvd_client;
+pub mod cache;
+pub mod cli;
+pub mod utils;
+pub mod consolidator; // Expose le consolidateur 🚀
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
-}
+pub use models::{Service, Vulnerability, ServiceList, ScanReport};
+pub use loader::{load_services_from_file, load_services_from_json};
+pub use data::get_cve_database;
+pub use scanner::{scan_services, count_by_severity, filter_by_severity, filter_by_cvss_score};
+pub use nvd_client::NvdClient;
+pub use cache::CveCache;
+pub use cli::Config;
+pub use utils::{format_json, find_files_by_pattern, save_json_file};
+pub use consolidator::generate_all_services_json; // Facilite l'import

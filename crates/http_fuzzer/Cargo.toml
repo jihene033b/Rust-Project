@@ -1,6 +1,13 @@
 [package]
 name = "http_fuzzer"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
 
 [dependencies]
+tokio = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+# Ajoute cette ligne spécifiquement pour la gestion des arguments CLI
+clap = { version = "4.4", features = ["derive"] }
+anyhow = { workspace = true } # <-- AJOUTE CETTE LIGNE
+serde_json = { workspace = true }
