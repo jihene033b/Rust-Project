@@ -1,5 +1,6 @@
 use cve_scanner::{
     load_services_from_file, scan_services, filter_by_severity, filter_by_cvss_score,
+    format_json, save_json_file,
     NvdClient, CveCache, Config,
 };
 use std::io::Write;
@@ -137,9 +138,9 @@ async fn enrich_with_nvd(report: &mut cve_scanner::ScanReport, config: &Config) 
     }
 }
 
-/// Sauvegarde le rapport en JSON
+/// Sauvegarde le rapport en JSON formaté
 fn save_report(report: &cve_scanner::ScanReport, path: &std::path::PathBuf) -> anyhow::Result<()> {
-    let json = serde_json::to_string_pretty(report)?;
-    std::fs::write(path, json)?;
+    let json = format_json(report)?;
+    save_json_file(path.to_str().unwrap(), &json)?;
     Ok(())
 }

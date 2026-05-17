@@ -5,6 +5,7 @@ pub mod scanner;
 pub mod nvd_client;
 pub mod cache;
 pub mod cli;
+pub mod utils;
 
 // Re-export les types principaux pour faciliter l'utilisation
 pub use models::{Service, Vulnerability, ServiceList, ScanReport};
@@ -14,6 +15,7 @@ pub use scanner::{scan_services, count_by_severity, filter_by_severity, filter_b
 pub use nvd_client::NvdClient;
 pub use cache::CveCache;
 pub use cli::Config;
+pub use utils::{format_json, find_files_by_pattern, save_json_file};
 
 #[cfg(test)]
 mod integration_tests {
