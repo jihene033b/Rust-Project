@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Représente un service trouvé sur la machine (ex: Apache 2.4.41)
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct Service {
     pub name: String,
     pub version: String,
@@ -18,8 +18,8 @@ pub struct Vulnerability {
     pub cvss_score: f32,
 }
 
-/// Wrapper pour charger un ensemble de services depuis JSON
-#[derive(Debug, Deserialize)]
+/// Wrapper pour charger et exporter un ensemble de services depuis/vers du JSON
+#[derive(Debug, Deserialize, Serialize)]
 pub struct ServiceList {
     pub services: Vec<Service>,
 }

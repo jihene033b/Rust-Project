@@ -1,295 +1,214 @@
-use cve_scanner::{
-    load_services_from_file, scan_services, filter_by_severity, filter_by_cvss_score,
-    format_json, save_json_file, find_files_by_pattern,
-    NvdClient, CveCache,
-};
 use std::io::Write;
-use std::fs;
+use std::fs::File;
+use std::path::{Path, PathBuf};
+
+use anyhow::Result;
+use clap::{Parser, Subcommand};
+use serde_json;
+use tokio::sync::mpsc;
+
+// Imports de vos crates internes du Workspace
+use http_fuzzer::{FuzzerArgs, run_fuzzer};
+use network_scanner::{PortInfo, ScanConfig, TOP_1000_PORTS, parse_ports, parse_targets, scan};
+
+#[derive(Parser)]
+#[command(name = "scanner", about = "Security tooling suite")]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    Fuzz {
+        #[command(flatten)]
+        args: FuzzerArgs,
+    },
+
+    Scan {
+        #[arg(short, long)]
+        target: String,
+
+        #[arg(short, long)]
+        ports: Option<String>,
+
+        #[arg(long)]
+        top_ports: Option<usize>,
+
+        #[arg(short = 'T', long, default_value = "3", value_parser = clap::value_parser!(u8).range(0..=5))]
+        timing: u8,
+
+        #[arg(long = "no-ping")]
+        no_ping: bool,
+
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
+
+    /// Centralise les rapports réseau/web et cherche les vulnérabilités correspondantes
+    Cve {
+        /// Le chemin vers le fichier de rapport final (ex: ./data/outputs/cve_report.json)
+        #[arg(short, long)]
+        output: PathBuf,
+    },
+}
+
+fn timing_config(level: u8) -> (usize, u64) {
+    match level {
+        0 => (1, 5000),
+        1 => (10, 3000),
+        2 => (50, 2000),
+        3 => (1000, 1000),
+        4 => (3000, 500),
+        5 => (5000, 200),
+        _ => (1000, 1000),
+    }
+}
 
 #[tokio::main]
-async fn main() {
-    let args: Vec<String> = std::env::args().collect();
-    
-    if args.len() < 2 {
-        print_help();
-        return;
-    }
+async fn main() -> Result<()> {
+    let cli = Cli::parse();
 
-    match args[1].as_str() {
-        "scan" => {
-            let scanner_args: Vec<String> = vec![args[0].clone()]
-                .into_iter()
-                .chain(args[2..].to_vec())
-                .collect();
+    match cli.command {
+        Commands::Fuzz { args } => {
+            println!("--- [ Configuration du Fuzzer ] ---");
+            println!("Cible : {}", args.url);
+            println!("-----------------------------------\n");
             
-            run_scanner(scanner_args).await;
-        }
-        "--help" | "-h" => print_help(),
-        _ => {
-            eprintln!("Unknown command: {}", args[1]);
-            print_help();
-        }
-    }
-}
-
-fn print_help() {
-    println!("🔒 Security Scan Orchestrator");
-    println!("\nUsage:");
-    println!("  cargo run -- scan <input_dir> --output <report_dir> [OPTIONS]");
-    println!("\nOptions:");
-    println!("  --pattern <regex>       Pattern to find scan files (default: net_scanner\\.json|scan_report\\.json)");
-    println!("  --cache <dir>           Cache directory (default: ./cache)");
-    println!("  --nvd                   Use NVD API for enrichment");
-    println!("  --min-severity LEVEL    Filter by severity (LOW, MEDIUM, HIGH, CRITICAL)");
-    println!("  --min-cvss SCORE        Filter by CVSS score");
-    println!("\nExample:");
-    println!("  cargo run -- scan crates/cve_scanner/results/scans --output crates/cve_scanner/results/reports --nvd");
-    println!("\nExpected input files:");
-    println!("  - net_scanner.json (from network scanner)");
-    println!("  - scan_report.json (from HTTP fuzzer)");
-}
-
-async fn run_scanner(args: Vec<String>) {
-    if args.len() < 2 {
-        eprintln!("❌ Missing arguments");
-        print_help();
-        std::process::exit(1);
-    }
-
-    let input_path = &args[1];
-    let mut output_dir = None;
-    let mut pattern = "(net_scanner|scan_report)\\.json$".to_string();
-    let mut cache_dir = "cache".to_string();
-    let mut use_nvd = false;
-    let mut min_severity = None;
-    let mut min_cvss_score = None;
-
-    // Parse les options
-    let mut i = 2;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--output" => {
-                if i + 1 < args.len() {
-                    output_dir = Some(args[i + 1].clone());
-                    i += 2;
-                } else {
-                    eprintln!("--output requires a directory path");
-                    std::process::exit(1);
-                }
-            }
-            "--pattern" => {
-                if i + 1 < args.len() {
-                    pattern = args[i + 1].clone();
-                    i += 2;
-                } else {
-                    eprintln!("--pattern requires a regex");
-                    std::process::exit(1);
-                }
-            }
-            "--cache" => {
-                if i + 1 < args.len() {
-                    cache_dir = args[i + 1].clone();
-                    i += 2;
-                } else {
-                    eprintln!("--cache requires a directory path");
-                    std::process::exit(1);
-                }
-            }
-            "--nvd" => {
-                use_nvd = true;
-                i += 1;
-            }
-            "--min-severity" => {
-                if i + 1 < args.len() {
-                    min_severity = Some(args[i + 1].clone());
-                    i += 2;
-                } else {
-                    eprintln!("--min-severity requires a level");
-                    std::process::exit(1);
-                }
-            }
-            "--min-cvss" => {
-                if i + 1 < args.len() {
-                    if let Ok(score) = args[i + 1].parse::<f32>() {
-                        min_cvss_score = Some(score);
-                    } else {
-                        eprintln!("Invalid CVSS score");
-                        std::process::exit(1);
-                    }
-                    i += 2;
-                } else {
-                    eprintln!("--min-cvss requires a number");
-                    std::process::exit(1);
-                }
-            }
-            _ => {
-                eprintln!("Unknown option: {}", args[i]);
-                i += 1;
-            }
-        }
-    }
-
-    // Créer le dossier cache s'il n'existe pas
-    let _ = fs::create_dir_all(&cache_dir);
-
-    println!("🚀 CVE Scanner v0.1.0\n");
-    println!("📂 Input directory: {}", input_path);
-    println!("📤 Output directory: {}", output_dir.as_ref().unwrap_or(&"(none)".to_string()));
-    println!("🔍 Pattern: {}", pattern);
-    println!("💾 Cache: {}", cache_dir);
-    println!("🔗 Use NVD API: {}\n", use_nvd);
-
-    // Trouver tous les fichiers JSON correspondant au pattern
-    println!("🔎 Discovering scan files with pattern: {}\n", pattern);
-    let scan_files = match find_files_by_pattern(input_path, &pattern) {
-        Ok(files) => files,
-        Err(e) => {
-            eprintln!("❌ Failed to discover files: {}", e);
-            std::process::exit(1);
-        }
-    };
-
-    if scan_files.is_empty() {
-        println!("⚠️  No files found matching pattern '{}' in '{}'", pattern, input_path);
-        return;
-    }
-
-    println!("✓ Found {} scan file(s)\n", scan_files.len());
-
-    // Traiter chaque fichier
-    for (index, filename) in scan_files.iter().enumerate() {
-        println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-        println!("[{}/{}] Processing: {}", index + 1, scan_files.len(), filename);
-        println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
-
-        let input_file = format!("{}/{}", input_path, filename);
-        
-        // Charger les services
-        println!("📦 Loading services...");
-        let services = match load_services_from_file(&input_file) {
-            Ok(svc) => {
-                println!("✓ Loaded {} services\n", svc.len());
-                svc
-            }
-            Err(e) => {
-                eprintln!("❌ Failed to load {}: {}\n", filename, e);
-                continue;
-            }
-        };
-
-        // Scanner les services
-        println!("🔍 Scanning services...");
-        let mut report = scan_services(services);
-        println!("✓ Found {} vulnerabilities\n", report.vulnerabilities_found.len());
-
-        // Enrichir avec l'API NVD si demandé
-        if use_nvd {
-            println!("🌐 Enriching with NVD API...");
-            enrich_with_nvd(&mut report, &cache_dir).await;
-            println!();
+            run_fuzzer(args).await?;
         }
 
-        // Filtrer les résultats
-        if let Some(ref severity) = min_severity {
-            println!("🎯 Filtering by severity: {}", severity);
-            let filtered = filter_by_severity(&report, severity);
-            println!("✓ {} vulnerabilities match filter\n", filtered.len());
-        }
-
-        if let Some(cvss) = min_cvss_score {
-            println!("📊 Filtering by CVSS score >= {}", cvss);
-            let filtered = filter_by_cvss_score(&report, cvss);
-            println!("✓ {} vulnerabilities match filter\n", filtered.len());
-        }
-
-        // Sauvegarder le rapport
-        if let Some(ref out_dir) = output_dir {
-            let _ = fs::create_dir_all(out_dir);
-            
-            // Générer un nom de rapport unique
-            let report_name = filename.replace(".json", "_report.json");
-            let output_file = format!("{}/{}", out_dir, report_name);
-            
-            println!("💾 Saving report to: {}", output_file);
-            match save_report(&report, &output_file) {
-                Ok(_) => println!("✓ Report saved\n"),
-                Err(e) => {
-                    eprintln!("❌ Failed to save report: {}\n", e);
-                    continue;
-                }
-            }
-        }
-
-        // Afficher le résumé
-        println!("📊 Summary:");
-        println!("  Total services: {}", report.scanned_services.len());
-        println!("  Vulnerabilities found: {}", report.vulnerabilities_found.len());
-        
-        if !report.vulnerabilities_found.is_empty() {
-            println!("\n🚨 Top Vulnerabilities:");
-            for vuln in report.vulnerabilities_found.iter().take(5) {
+        Commands::Scan {
+            target,
+            ports,
+            top_ports,
+            timing,
+            no_ping,
+            output,
+        } => {
+            // Sécurité pour les modes agressifs
+            if timing >= 4 {
                 println!(
-                    "  - {} [{}] {} (CVSS: {:.1})",
-                    vuln.cve_id, vuln.severity, vuln.service_name, vuln.cvss_score
+                    "  T{} est {} et peut surcharger le réseau ou déclencher des alertes IDS.",
+                    timing,
+                    if timing == 5 { "INSANE" } else { "AGRESSIF" }
+                );
+                print!("Continuer ? [y/N] : ");
+                std::io::stdout().flush()?;
+                let mut input = String::new();
+                std::io::stdin().read_line(&mut input)?;
+                if !input.trim().eq_ignore_ascii_case("y") {
+                    println!("Annulé.");
+                    return Ok(());
+                }
+            }
+
+            // Sélection des ports
+            let port_list: Vec<u16> = if let Some(p) = ports {
+                parse_ports(&p)?
+            } else if let Some(n) = top_ports {
+                TOP_1000_PORTS.iter().take(n).copied().collect()
+            } else {
+                TOP_1000_PORTS.to_vec()
+            };
+
+            let (concurrency, timeout_ms) = timing_config(timing);
+            let targets = parse_targets(&target)?;
+            let total = targets.len();
+
+            println!("--- [ Network Scanner ] ---");
+            println!("Target  : {}", target);
+            println!("Hosts   : {}", total);
+            println!("Ports   : {}", port_list.len());
+            println!("Timing  : T{}", timing);
+            println!("Threads : {}", concurrency);
+            println!("Timeout : {}ms", timeout_ms);
+            println!("---------------------------\n");
+
+            let config = ScanConfig {
+                concurrency,
+                timeout_ms,
+                skip_ping: no_ping,
+                ports: port_list,
+                mode: network_scanner::ScanMode::TcpConnect, // ou SynScan selon vos fonctionnalités
+            };
+
+            // Canal mpsc pour l'affichage temps réel
+            let (tx, mut rx) = mpsc::channel::<(String, PortInfo)>(256);
+
+            println!("{:<10} {:<10} {:<16} {}", "PORT", "STATE", "SERVICE", "BANNER");
+            println!("{}", "-".repeat(70));
+
+            let printer = tokio::spawn(async move {
+                while let Some((_ip, info)) = rx.recv().await {
+                    let banner = info.banner.as_deref().unwrap_or("");
+                    println!(
+                        "{:<10} {:<10} {:<16} {}",
+                        format!("{}/tcp", info.port),
+                        info.state.to_string(),
+                        info.service,
+                        banner
+                    );
+                }
+            });
+
+            // Lancement du scan
+            let results = scan(targets, config, tx).await?;
+            printer.await?;
+
+            println!("\n--- [ Résumé du Scan ] ---");
+            for result in &results {
+                println!(
+                    "{} : {} open, {} closed, {} filtered",
+                    result.ip,
+                    result.open_ports.len(),
+                    result.closed_count,
+                    result.filtered_count,
                 );
             }
-            if report.vulnerabilities_found.len() > 5 {
-                println!("  ... and {} more", report.vulnerabilities_found.len() - 5);
+
+            // Exportation propre sans hôtes vides
+            if let Some(output_path) = output {
+                println!("\n[+] Écriture du rapport réseau JSON dans : {:?}", output_path);
+                let filtered_results: Vec<&network_scanner::ScanResult> = results
+                    .iter()
+                    .filter(|res| !res.open_ports.is_empty())
+                    .collect();
+
+                let file = File::create(&output_path)?;
+                serde_json::to_writer_pretty(file, &filtered_results)?;
+                println!("[+] Rapport réseau généré avec succès !");
             }
         }
 
-        println!();
+        Commands::Cve { output } => {
+            println!("\n--- [ 1. Normalisation & Centralisation des Services ] ---");
+            let net_json = Path::new("./data/outputs/net_scanner.json");
+            let fuzz_json = Path::new("./data/outputs/scan_report.json");
+            let all_services_json = Path::new("./data/outputs/all_services.json");
+
+            // Appel de la fonction de fusion située dans la crate de ton collègue
+            cve_scanner::generate_all_services_json(net_json, fuzz_json, all_services_json)?;
+
+            println!("\n--- [ 2. Analyse des Vulnérabilités (CVE Scanner) ] ---");
+            // Chargement des services uniques structurés
+            let services = cve_scanner::loader::load_services_from_file("./data/outputs/all_services.json")?;
+            println!("[+] {} composants uniques prêts pour l'analyse.", services.len());
+
+            // Exécution du moteur de correspondance CVE
+            let report = cve_scanner::scanner::scan_services(services);
+            println!("[*] Résumé du scanneur : {}", report.summary);
+
+            // Exportation du livrable final
+            let json_content = cve_scanner::format_json(&report.vulnerabilities_found)?;
+
+            // 2. On utilise sa vraie fonction de sauvegarde sur le disque
+            let output_str = output.to_string_lossy();
+            cve_scanner::save_json_file(&output_str, &json_content)?;
+
+            println!("[+] Rapport de vulnérabilités généré avec succès dans : {:?}", output);
+        }
     }
 
-    println!("✅ All scans completed!");
-}
-
-/// Enrichit le rapport avec les données de l'API NVD
-async fn enrich_with_nvd(report: &mut cve_scanner::ScanReport, cache_dir: &str) {
-    let client = NvdClient::new();
-    let cache = match CveCache::new(cache_dir) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("⚠️  Cache error (continuing without cache): {}", e);
-            return;
-        }
-    };
-
-    let vuln_count = report.vulnerabilities_found.len();
-    
-    for index in 0..vuln_count {
-        let cve_id = report.vulnerabilities_found[index].cve_id.clone();
-        print!("  [{}/{}] Enriching {}... ", index + 1, vuln_count, cve_id);
-        std::io::stdout().flush().ok();
-
-        // Essayer le cache d'abord
-        if let Ok(Some(cached)) = cache.get(&cve_id) {
-            report.vulnerabilities_found[index].description = cached.description;
-            report.vulnerabilities_found[index].cvss_score = cached.cvss_score;
-            println!("(cached)");
-            continue;
-        }
-
-        // Sinon, interroger l'API NVD
-        match client.enrich_vulnerability(&mut report.vulnerabilities_found[index]).await {
-            Ok(_) => {
-                let _ = cache.set(
-                    &cve_id,
-                    report.vulnerabilities_found[index].description.clone(),
-                    report.vulnerabilities_found[index].cvss_score,
-                );
-                println!("(from API)");
-            }
-            Err(e) => {
-                println!("(error: {})", e);
-            }
-        }
-    }
-}
-
-/// Sauvegarde le rapport en JSON formaté
-fn save_report(report: &cve_scanner::ScanReport, path: &str) -> anyhow::Result<()> {
-    let json = format_json(report)?;
-    save_json_file(path, &json)?;
     Ok(())
 }
