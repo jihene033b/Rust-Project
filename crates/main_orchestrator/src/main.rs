@@ -50,6 +50,10 @@ enum Commands {
         /// Le chemin vers le fichier de rapport final (ex: ./data/outputs/cve_report.json)
         #[arg(short, long)]
         output: PathBuf,
+
+        /// Activer l'interrogation et l'enrichissement en temps réel via l'API NVD du NIST
+        #[arg(long)]
+        nvd: bool,
     },
 }
 
@@ -181,32 +185,56 @@ async fn main() -> Result<()> {
             }
         }
 
-        Commands::Cve { output } => {
+        Commands::Cve { output, nvd } => {
             println!("\n--- [ 1. Normalisation & Centralisation des Services ] ---");
             let net_json = Path::new("./data/outputs/net_scanner.json");
             let fuzz_json = Path::new("./data/outputs/scan_report.json");
             let all_services_json = Path::new("./data/outputs/all_services.json");
 
-            // Appel de la fonction de fusion située dans la crate de ton collègue
+            // Extraction et création de all_services.json unifié
             cve_scanner::generate_all_services_json(net_json, fuzz_json, all_services_json)?;
 
-            println!("\n--- [ 2. Analyse des Vulnérabilités (CVE Scanner) ] ---");
-            // Chargement des services uniques structurés
+            println!("\n--- [ 2. Analyse Initiale (Local matching) ] ---");
             let services = cve_scanner::loader::load_services_from_file("./data/outputs/all_services.json")?;
-            println!("[+] {} composants uniques prêts pour l'analyse.", services.len());
+            println!("[+] {} composants uniques identifiés.", services.len());
 
-            // Exécution du moteur de correspondance CVE
-            let report = cve_scanner::scanner::scan_services(services);
-            println!("[*] Résumé du scanneur : {}", report.summary);
+            let mut report = cve_scanner::scanner::scan_services(services);
 
-            // Exportation du livrable final
+            // 🚀 ENRICHISSEMENT ET INTERROGATION EN LIGNE VIA LE CODE DE TON AMI
+            if nvd {
+                println!("\n--- [ 3. Interrogation de la base NVD du NIST (Cache actif) ] ---");
+                let cache = cve_scanner::CveCache::new("./cache")?;
+                let nvd_client = cve_scanner::NvdClient::new();
+
+                for vuln in &mut report.vulnerabilities_found {
+                    print!(" -> Analyse de {} ... ", vuln.cve_id);
+                    std::io::stdout().flush()?;
+
+                    // Étape 1 : On regarde si la CVE est déjà documentée dans notre cache local
+                    if let Ok(Some(cached_data)) = cache.get(&vuln.cve_id) {
+                        println!("(Hit Cache 📦)");
+                        vuln.description = cached_data.description;
+                        vuln.cvss_score = cached_data.cvss_score;
+                    } else {
+                        // Étape 2 : Sinon, on appelle l'API officielle
+                        println!("(Requête API NVD 🌐)");
+                        if let Err(e) = nvd_client.enrich_vulnerability(vuln).await {
+                            eprintln!("    [⚠️ Erreur NVD] Impossible de joindre le NIST pour {} : {}", vuln.cve_id, e);
+                        } else {
+                            // Étape 3 : On stocke le résultat pour les prochaines fois
+                            let _ = cache.set(&vuln.cve_id, vuln.description.clone(), vuln.cvss_score);
+                        }
+                    }
+                }
+            }
+
+            println!("\n--- [ 4. Génération du Rapport Final ] ---");
+            // Utilisation des fonctions de sauvegarde de ton collègue
             let json_content = cve_scanner::format_json(&report.vulnerabilities_found)?;
-
-            // 2. On utilise sa vraie fonction de sauvegarde sur le disque
             let output_str = output.to_string_lossy();
             cve_scanner::save_json_file(&output_str, &json_content)?;
-
-            println!("[+] Rapport de vulnérabilités généré avec succès dans : {:?}", output);
+            
+            println!("[+] Livrable de vulnérabilités mis à jour avec succès : {:?}", output);
         }
     }
 
