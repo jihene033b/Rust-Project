@@ -1,4 +1,3 @@
-use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
@@ -189,7 +188,7 @@ fn parse_cidr(cidr: &str) -> Result<Vec<IpAddr>> {
 
     let base: Ipv4Addr = ip_str.parse()?;
     let prefix: u32 = prefix_str.parse()?;
-    ///32 and /31 are handled as special cases.
+    // 32 and /31 are handled as special cases.
     if prefix > 32 {
         return Err(anyhow!("Prefix length must be <= 32, got {}", prefix));
     }
@@ -203,7 +202,6 @@ fn parse_cidr(cidr: &str) -> Result<Vec<IpAddr>> {
     let network = base_u32 & mask;
     let broadcast = network | !mask;
 
-  
     if prefix == 32 {
         return Ok(vec![IpAddr::V4(base)]);
     }
@@ -297,8 +295,17 @@ async fn scan_host(
 ) -> ScanResult {
     match config.mode {
         ScanMode::TcpConnect => tcp_connect_scan(ip, config, semaphore, tx).await,
-        ScanMode::Syn => syn_scan(ip, config, tx).await,
         ScanMode::Udp => udp_scan(ip, config, semaphore, tx).await,
+        ScanMode::Syn => {
+            println!("[!] Le mode SYN Scan n'est pas disponible dans cette configuration épurée.");
+            ScanResult {
+                ip: ip.to_string(),
+                open_ports: vec![],
+                closed_count: 0,
+                filtered_count: 0,
+                open_filtered_count: 0,
+            }
+        }
     }
 }
 
@@ -382,7 +389,6 @@ async fn udp_scan(
                 service: service_name(port).to_string(),
                 banner,
             };
-            // for UDP we display both open and open|filtered
             if matches!(state, PortState::Open | PortState::OpenFiltered) {
                 let _ = tx.send((ip_str, info.clone())).await;
             }
@@ -417,186 +423,6 @@ async fn udp_scan(
         filtered_count,
         open_filtered_count,
     }
-}
-
-// Runs the SYN scan in a background thread because pnet uses blocking calls
-async fn syn_scan(
-    ip: IpAddr,
-    config: &ScanConfig,
-    tx: &mpsc::Sender<(String, PortInfo)>,
-) -> ScanResult {
-    let IpAddr::V4(ipv4) = ip else {
-        eprintln!("[!] SYN scan: IPv6 non supporté");
-        return ScanResult {
-            ip: ip.to_string(),
-            open_ports: vec![],
-            closed_count: 0,
-            filtered_count: 0,
-            open_filtered_count: 0,
-        };
-    };
-
-    let ports = config.ports.clone();
-    let timeout_ms = config.timeout_ms;
-
-    let states =
-        tokio::task::spawn_blocking(move || syn_scan_host_blocking(ipv4, &ports, timeout_ms))
-            .await
-            .unwrap_or_default();
-
-    let mut open_ports = Vec::new();
-    let mut closed_count = 0;
-    let mut filtered_count = 0;
-
-    for (port, state) in states {
-        let info = PortInfo {
-            port,
-            state: state.clone(),
-            service: service_name(port).to_string(),
-            banner: None,
-        };
-        match state {
-            PortState::Open => {
-                let _ = tx.send((ip.to_string(), info.clone())).await;
-                open_ports.push(info);
-            }
-            PortState::Closed => closed_count += 1,
-            PortState::Filtered | PortState::OpenFiltered => filtered_count += 1,
-        }
-    }
-    open_ports.sort_by_key(|p| p.port);
-
-    ScanResult {
-        ip: ip.to_string(),
-        open_ports,
-        closed_count,
-        filtered_count,
-        open_filtered_count: 0,
-    }
-}
-
-// sends raw SYN packets and reads replies to find open ports (needs root to run )
-fn syn_scan_host_blocking(
-    dest_ip: Ipv4Addr,
-    ports: &[u16],
-    timeout_ms: u64,
-) -> HashMap<u16, PortState> {
-    use pnet::packet::ip::IpNextHeaderProtocols;
-    use pnet::packet::tcp::{MutableTcpPacket, TcpFlags};
-    use pnet::transport::{
-        TransportChannelType::Layer4, TransportProtocol::Ipv4 as PnetIpv4, tcp_packet_iter,
-        transport_channel,
-    };
-
-    let mut results: HashMap<u16, PortState> =
-        ports.iter().map(|&p| (p, PortState::Filtered)).collect();
-
-    let local_ip = match get_local_ipv4() {
-        Some(ip) => ip,
-        None => {
-            eprintln!("[!] SYN scan: impossible de déterminer l'IP locale");
-            return results;
-        }
-    };
-
-    let protocol = Layer4(PnetIpv4(IpNextHeaderProtocols::Tcp));
-    let (mut tx_chan, mut rx_chan) = match transport_channel(65536, protocol) {
-        Ok(pair) => pair,
-        Err(e) => {
-            eprintln!("[!] SYN scan nécessite les droits root: {}", e);
-            return results;
-        }
-    };
-
-    let source_port: u16 = 49152;
-    let port_set: HashSet<u16> = ports.iter().copied().collect();
-
-    for &port in ports {
-        let mut buf = [0u8; 20];
-        let mut pkt = MutableTcpPacket::new(&mut buf).unwrap();
-        pkt.set_source(source_port);
-        pkt.set_destination(port);
-        pkt.set_sequence(simple_seq(port));
-        pkt.set_acknowledgement(0);
-        pkt.set_data_offset(5);
-        pkt.set_flags(TcpFlags::SYN);
-        pkt.set_window(65535);
-        let cksum = pnet::packet::tcp::ipv4_checksum(&pkt.to_immutable(), &local_ip, &dest_ip);
-        pkt.set_checksum(cksum);
-        let _ = tx_chan.send_to(pkt.to_immutable(), IpAddr::V4(dest_ip));
-    }
-
-    let mut iter = tcp_packet_iter(&mut rx_chan);
-    let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms + 2000);
-    let mut pending = port_set.len();
-
-    loop {
-        if pending == 0 {
-            break;
-        }
-        let now = std::time::Instant::now();
-        if now >= deadline {
-            break;
-        }
-        let wait = deadline - now;
-
-        match iter.next_with_timeout(wait) {
-            Ok(Some((packet, src_addr))) => {
-                let src_v4 = match src_addr {
-                    IpAddr::V4(v4) => v4,
-                    _ => continue,
-                };
-                if src_v4 != dest_ip {
-                    continue;
-                }
-                if packet.get_destination() != source_port {
-                    continue;
-                }
-
-                let port = packet.get_source();
-                if !port_set.contains(&port) {
-                    continue;
-                }
-
-                let flags = packet.get_flags();
-                let new_state = if flags & TcpFlags::SYN != 0 && flags & TcpFlags::ACK != 0 {
-                    PortState::Open
-                } else if flags & TcpFlags::RST != 0 {
-                    PortState::Closed
-                } else {
-                    continue;
-                };
-
-                if results.get(&port) == Some(&PortState::Filtered) {
-                    pending = pending.saturating_sub(1);
-                }
-                results.insert(port, new_state);
-            }
-            Ok(None) | Err(_) => break,
-        }
-    }
-
-    results
-}
-
-// gives each port a unique sequence number so we can match replies to the right request
-fn simple_seq(port: u16) -> u32 {
-    0x1337_0000u32 | (port as u32)
-}
-
-// finds our local IP address  (need it to build valid SYN packets)
-fn get_local_ipv4() -> Option<Ipv4Addr> {
-    for iface in pnet::datalink::interfaces() {
-        if iface.is_loopback() || !iface.is_up() {
-            continue;
-        }
-        for ip_net in &iface.ips {
-            if let IpAddr::V4(v4) = ip_net.ip() {
-                return Some(v4);
-            }
-        }
-    }
-    None
 }
 
 // connects to a TCP port and tries to read the service banner
@@ -643,7 +469,6 @@ async fn probe_port_udp(ip: IpAddr, port: u16, timeout_ms: u64) -> (PortState, O
             (PortState::Open, line.filter(|s| !s.is_empty()))
         }
         Ok(Err(e)) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
-            // ICMP port unreachable → closed
             (PortState::Closed, None)
         }
         _ => (PortState::OpenFiltered, None),
@@ -653,9 +478,7 @@ async fn probe_port_udp(ip: IpAddr, port: u16, timeout_ms: u64) -> (PortState, O
 // returns the right bytes to send to get a response from a UDP service
 fn udp_probe(port: u16) -> &'static [u8] {
     match port {
-        
         53 => b"\x00\x00\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x07version\x04bind\x00\x00\x10\x00\x03",
-       
         161 => b"\x30\x26\x02\x01\x00\x04\x06public\xa0\x19\x02\x04\x00\x00\x00\x00\x02\x01\x00\x02\x01\x00\x30\x0b\x30\x09\x06\x05\x2b\x06\x01\x02\x01\x05\x00",
         _ => b"\x00",
     }
@@ -741,41 +564,6 @@ fn service_name(port: u16) -> &'static str {
         27017 => "mongodb",
         _ => "unknown",
     }
-}
-
-// exports scan results to a JSON file 
-// we include only hosts with at least one open port 
-pub fn export_json(results: &[ScanResult], path: &str) -> Result<()> {
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    #[derive(Serialize)]
-    struct Report<'a> {
-        scanned_at: u64,
-        total_hosts_scanned: usize,
-        hosts_with_findings: usize,
-        results: Vec<&'a ScanResult>,
-    }
-
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-
-    let interesting: Vec<&ScanResult> = results
-        .iter()
-        .filter(|r| !r.open_ports.is_empty())
-        .collect();
-
-    let report = Report {
-        scanned_at: ts,
-        total_hosts_scanned: results.len(),
-        hosts_with_findings: interesting.len(),
-        results: interesting,
-    };
-
-    let json = serde_json::to_string_pretty(&report)?;
-    std::fs::write(path, json)?;
-    Ok(())
 }
 
 #[cfg(test)]

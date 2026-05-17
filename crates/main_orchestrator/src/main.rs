@@ -4,8 +4,8 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use http_fuzzer::{FuzzerArgs, run_fuzzer};
 use network_scanner::{
-    PortInfo, ScanConfig, ScanMode, TOP_1000_PORTS, TOP_UDP_PORTS, export_json, parse_ports,
-    parse_targets, scan,
+    PortInfo, ScanConfig, ScanMode, TOP_1000_PORTS, TOP_UDP_PORTS,
+    parse_ports, parse_targets, scan,
 };
 use tokio::sync::mpsc;
 
@@ -215,9 +215,24 @@ async fn main() -> Result<()> {
                 println!("{}", line);
             }
 
-            if let Some(path) = output {
-                export_json(&results, &path)?;
-                println!("\n[+] Résultats exportés vers {}", path);
+            // --- ENREGISTREMENT DU RAPPORT DE SCAN EN JSON ---
+            if let Some(output_path) = output {
+                println!("\n[+] Écriture du rapport réseau JSON dans : {:?}", output_path);
+                
+                // On filtre les résultats pour ne garder que les machines avec au moins un port ouvert
+                let filtered_results: Vec<&network_scanner::ScanResult> = results
+                    .iter()
+                    .filter(|res| !res.open_ports.is_empty())
+                    .collect();
+
+                let file = std::fs::File::create(&output_path)?;
+                // On sérialise le vecteur filtré à la place du vecteur complet
+                serde_json::to_writer_pretty(file, &filtered_results)?;
+                
+                println!(
+                    "[+] Rapport réseau JSON généré avec succès ! ({} hôtes actifs trouvés)", 
+                    filtered_results.len()
+                );
             }
         }
     }
