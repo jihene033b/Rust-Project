@@ -3,3 +3,4 @@
 Cargo.lock
 data/outputs/*
 !data/outputs/.gitkeep
+CLAUDE.md
