@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
@@ -79,11 +80,17 @@ pub const TOP_1000_PORTS: &[u16] = &[
     64680, 65000, 65129, 65389,
 ];
 
+pub const TOP_UDP_PORTS: &[u16] = &[
+    53, 67, 68, 69, 111, 123, 135, 137, 138, 161, 162, 177, 389, 445, 500, 514, 520, 623, 631,
+    1194, 1434, 1900, 4500, 5353, 5355, 10000,
+];
+
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub enum PortState {
     Open,
     Closed,
     Filtered,
+    OpenFiltered,
 }
 
 impl fmt::Display for PortState {
@@ -92,8 +99,17 @@ impl fmt::Display for PortState {
             PortState::Open => write!(f, "open"),
             PortState::Closed => write!(f, "closed"),
             PortState::Filtered => write!(f, "filtered"),
+            PortState::OpenFiltered => write!(f, "open|filtered"),
         }
     }
+}
+
+#[derive(Debug, Default, Clone, PartialEq)]
+pub enum ScanMode {
+    #[default]
+    TcpConnect,
+    Syn,
+    Udp,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -110,6 +126,7 @@ pub struct ScanResult {
     pub open_ports: Vec<PortInfo>,
     pub closed_count: usize,
     pub filtered_count: usize,
+    pub open_filtered_count: usize,
 }
 
 pub struct ScanConfig {
@@ -117,6 +134,7 @@ pub struct ScanConfig {
     pub timeout_ms: u64,
     pub skip_ping: bool,
     pub ports: Vec<u16>,
+    pub mode: ScanMode,
 }
 
 impl Default for ScanConfig {
@@ -126,10 +144,12 @@ impl Default for ScanConfig {
             timeout_ms: 1000,
             skip_ping: false,
             ports: TOP_1000_PORTS.to_vec(),
+            mode: ScanMode::TcpConnect,
         }
     }
 }
 
+// converts a port string like `22`, `80,443` or `1-1000` into a list of port numbers
 pub fn parse_ports(input: &str) -> Result<Vec<u16>> {
     let mut ports = Vec::new();
     for part in input.split(',') {
@@ -150,6 +170,7 @@ pub fn parse_ports(input: &str) -> Result<Vec<u16>> {
     Ok(ports)
 }
 
+// turns a target string (single IP, CIDR, or range) into a list of IP addresses
 pub fn parse_targets(input: &str) -> Result<Vec<IpAddr>> {
     if input.contains('/') {
         parse_cidr(input)
@@ -160,6 +181,7 @@ pub fn parse_targets(input: &str) -> Result<Vec<IpAddr>> {
     }
 }
 
+// expands a CIDR like `192.168.1.0/24` into all its host IPs
 fn parse_cidr(cidr: &str) -> Result<Vec<IpAddr>> {
     let (ip_str, prefix_str) = cidr
         .split_once('/')
@@ -167,6 +189,7 @@ fn parse_cidr(cidr: &str) -> Result<Vec<IpAddr>> {
 
     let base: Ipv4Addr = ip_str.parse()?;
     let prefix: u32 = prefix_str.parse()?;
+    ///32 and /31 are handled as special cases.
     if prefix > 32 {
         return Err(anyhow!("Prefix length must be <= 32, got {}", prefix));
     }
@@ -180,11 +203,23 @@ fn parse_cidr(cidr: &str) -> Result<Vec<IpAddr>> {
     let network = base_u32 & mask;
     let broadcast = network | !mask;
 
+  
+    if prefix == 32 {
+        return Ok(vec![IpAddr::V4(base)]);
+    }
+    if prefix == 31 {
+        return Ok(vec![
+            IpAddr::V4(Ipv4Addr::from(network)),
+            IpAddr::V4(Ipv4Addr::from(broadcast)),
+        ]);
+    }
+
     Ok((network + 1..broadcast)
         .map(|ip| IpAddr::V4(Ipv4Addr::from(ip)))
         .collect())
 }
 
+// expands a range like `192.168.1.1-192.168.1.10` into individual IPs
 fn parse_range(range: &str) -> Result<Vec<IpAddr>> {
     let (start_str, end_str) = range
         .split_once('-')
@@ -205,12 +240,14 @@ fn parse_range(range: &str) -> Result<Vec<IpAddr>> {
         .collect())
 }
 
+// scans all target hosts one by one, pinging first to check they are alive (unless --no-ping is set)
 pub async fn scan(
     targets: Vec<IpAddr>,
     config: ScanConfig,
     tx: mpsc::Sender<(String, PortInfo)>,
 ) -> Result<Vec<ScanResult>> {
     let semaphore = Arc::new(Semaphore::new(config.concurrency));
+    let config = Arc::new(config);
     let mut results = Vec::new();
 
     for ip in targets {
@@ -226,13 +263,14 @@ pub async fn scan(
             println!("[*] {} — hôte actif", ip);
         }
 
-        let result = scan_host(ip, &config.ports, &semaphore, config.timeout_ms, &tx).await;
+        let result = scan_host(ip, &config, &semaphore, &tx).await;
         results.push(result);
     }
 
     Ok(results)
 }
 
+// returns true if the host replies to a ping
 pub async fn ping_host(ip: IpAddr) -> bool {
     #[cfg(target_os = "macos")]
     let args = ["-c", "1", "-W", "1000", &ip.to_string()];
@@ -250,19 +288,34 @@ pub async fn ping_host(ip: IpAddr) -> bool {
     }
 }
 
+// picks the right scan method (TCP connect, SYN, or UDP) and runs it on one host
 async fn scan_host(
     ip: IpAddr,
-    ports: &[u16],
+    config: &ScanConfig,
     semaphore: &Arc<Semaphore>,
-    timeout_ms: u64,
     tx: &mpsc::Sender<(String, PortInfo)>,
 ) -> ScanResult {
-    let mut handles = Vec::with_capacity(ports.len());
+    match config.mode {
+        ScanMode::TcpConnect => tcp_connect_scan(ip, config, semaphore, tx).await,
+        ScanMode::Syn => syn_scan(ip, config, tx).await,
+        ScanMode::Udp => udp_scan(ip, config, semaphore, tx).await,
+    }
+}
 
-    for &port in ports {
+// tries to connect to each port: open if it works, closed if refused, filtered if no reply
+async fn tcp_connect_scan(
+    ip: IpAddr,
+    config: &ScanConfig,
+    semaphore: &Arc<Semaphore>,
+    tx: &mpsc::Sender<(String, PortInfo)>,
+) -> ScanResult {
+    let mut handles = Vec::with_capacity(config.ports.len());
+
+    for &port in &config.ports {
         let sem = semaphore.clone();
         let tx = tx.clone();
         let ip_str = ip.to_string();
+        let timeout_ms = config.timeout_ms;
 
         handles.push(tokio::spawn(async move {
             let _permit = sem.acquire().await.unwrap();
@@ -273,7 +326,6 @@ async fn scan_host(
                 service: service_name(port).to_string(),
                 banner,
             };
-            // que les ports ouverts
             if state == PortState::Open {
                 let _ = tx.send((ip_str, info.clone())).await;
             }
@@ -291,6 +343,7 @@ async fn scan_host(
                 PortState::Open => open_ports.push(info),
                 PortState::Closed => closed_count += 1,
                 PortState::Filtered => filtered_count += 1,
+                PortState::OpenFiltered => filtered_count += 1,
             }
         }
     }
@@ -301,9 +354,252 @@ async fn scan_host(
         open_ports,
         closed_count,
         filtered_count,
+        open_filtered_count: 0,
     }
 }
 
+// sends a UDP packet to each port and checks for a reply
+async fn udp_scan(
+    ip: IpAddr,
+    config: &ScanConfig,
+    semaphore: &Arc<Semaphore>,
+    tx: &mpsc::Sender<(String, PortInfo)>,
+) -> ScanResult {
+    let mut handles = Vec::with_capacity(config.ports.len());
+
+    for &port in &config.ports {
+        let sem = semaphore.clone();
+        let tx = tx.clone();
+        let ip_str = ip.to_string();
+        let timeout_ms = config.timeout_ms;
+
+        handles.push(tokio::spawn(async move {
+            let _permit = sem.acquire().await.unwrap();
+            let (state, banner) = probe_port_udp(ip, port, timeout_ms).await;
+            let info = PortInfo {
+                port,
+                state: state.clone(),
+                service: service_name(port).to_string(),
+                banner,
+            };
+            // for UDP we display both open and open|filtered
+            if matches!(state, PortState::Open | PortState::OpenFiltered) {
+                let _ = tx.send((ip_str, info.clone())).await;
+            }
+            info
+        }));
+    }
+
+    let mut open_ports = Vec::new();
+    let mut closed_count = 0;
+    let mut filtered_count = 0;
+    let mut open_filtered_count = 0;
+
+    for handle in handles {
+        if let Ok(info) = handle.await {
+            match info.state {
+                PortState::Open => open_ports.push(info),
+                PortState::Closed => closed_count += 1,
+                PortState::Filtered => filtered_count += 1,
+                PortState::OpenFiltered => {
+                    open_filtered_count += 1;
+                    open_ports.push(info);
+                }
+            }
+        }
+    }
+    open_ports.sort_by_key(|p| p.port);
+
+    ScanResult {
+        ip: ip.to_string(),
+        open_ports,
+        closed_count,
+        filtered_count,
+        open_filtered_count,
+    }
+}
+
+// Runs the SYN scan in a background thread because pnet uses blocking calls
+async fn syn_scan(
+    ip: IpAddr,
+    config: &ScanConfig,
+    tx: &mpsc::Sender<(String, PortInfo)>,
+) -> ScanResult {
+    let IpAddr::V4(ipv4) = ip else {
+        eprintln!("[!] SYN scan: IPv6 non supporté");
+        return ScanResult {
+            ip: ip.to_string(),
+            open_ports: vec![],
+            closed_count: 0,
+            filtered_count: 0,
+            open_filtered_count: 0,
+        };
+    };
+
+    let ports = config.ports.clone();
+    let timeout_ms = config.timeout_ms;
+
+    let states =
+        tokio::task::spawn_blocking(move || syn_scan_host_blocking(ipv4, &ports, timeout_ms))
+            .await
+            .unwrap_or_default();
+
+    let mut open_ports = Vec::new();
+    let mut closed_count = 0;
+    let mut filtered_count = 0;
+
+    for (port, state) in states {
+        let info = PortInfo {
+            port,
+            state: state.clone(),
+            service: service_name(port).to_string(),
+            banner: None,
+        };
+        match state {
+            PortState::Open => {
+                let _ = tx.send((ip.to_string(), info.clone())).await;
+                open_ports.push(info);
+            }
+            PortState::Closed => closed_count += 1,
+            PortState::Filtered | PortState::OpenFiltered => filtered_count += 1,
+        }
+    }
+    open_ports.sort_by_key(|p| p.port);
+
+    ScanResult {
+        ip: ip.to_string(),
+        open_ports,
+        closed_count,
+        filtered_count,
+        open_filtered_count: 0,
+    }
+}
+
+// sends raw SYN packets and reads replies to find open ports (needs root to run )
+fn syn_scan_host_blocking(
+    dest_ip: Ipv4Addr,
+    ports: &[u16],
+    timeout_ms: u64,
+) -> HashMap<u16, PortState> {
+    use pnet::packet::ip::IpNextHeaderProtocols;
+    use pnet::packet::tcp::{MutableTcpPacket, TcpFlags};
+    use pnet::transport::{
+        TransportChannelType::Layer4, TransportProtocol::Ipv4 as PnetIpv4, tcp_packet_iter,
+        transport_channel,
+    };
+
+    let mut results: HashMap<u16, PortState> =
+        ports.iter().map(|&p| (p, PortState::Filtered)).collect();
+
+    let local_ip = match get_local_ipv4() {
+        Some(ip) => ip,
+        None => {
+            eprintln!("[!] SYN scan: impossible de déterminer l'IP locale");
+            return results;
+        }
+    };
+
+    let protocol = Layer4(PnetIpv4(IpNextHeaderProtocols::Tcp));
+    let (mut tx_chan, mut rx_chan) = match transport_channel(65536, protocol) {
+        Ok(pair) => pair,
+        Err(e) => {
+            eprintln!("[!] SYN scan nécessite les droits root: {}", e);
+            return results;
+        }
+    };
+
+    let source_port: u16 = 49152;
+    let port_set: HashSet<u16> = ports.iter().copied().collect();
+
+    for &port in ports {
+        let mut buf = [0u8; 20];
+        let mut pkt = MutableTcpPacket::new(&mut buf).unwrap();
+        pkt.set_source(source_port);
+        pkt.set_destination(port);
+        pkt.set_sequence(simple_seq(port));
+        pkt.set_acknowledgement(0);
+        pkt.set_data_offset(5);
+        pkt.set_flags(TcpFlags::SYN);
+        pkt.set_window(65535);
+        let cksum = pnet::packet::tcp::ipv4_checksum(&pkt.to_immutable(), &local_ip, &dest_ip);
+        pkt.set_checksum(cksum);
+        let _ = tx_chan.send_to(pkt.to_immutable(), IpAddr::V4(dest_ip));
+    }
+
+    let mut iter = tcp_packet_iter(&mut rx_chan);
+    let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms + 2000);
+    let mut pending = port_set.len();
+
+    loop {
+        if pending == 0 {
+            break;
+        }
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            break;
+        }
+        let wait = deadline - now;
+
+        match iter.next_with_timeout(wait) {
+            Ok(Some((packet, src_addr))) => {
+                let src_v4 = match src_addr {
+                    IpAddr::V4(v4) => v4,
+                    _ => continue,
+                };
+                if src_v4 != dest_ip {
+                    continue;
+                }
+                if packet.get_destination() != source_port {
+                    continue;
+                }
+
+                let port = packet.get_source();
+                if !port_set.contains(&port) {
+                    continue;
+                }
+
+                let flags = packet.get_flags();
+                let new_state = if flags & TcpFlags::SYN != 0 && flags & TcpFlags::ACK != 0 {
+                    PortState::Open
+                } else if flags & TcpFlags::RST != 0 {
+                    PortState::Closed
+                } else {
+                    continue;
+                };
+
+                if results.get(&port) == Some(&PortState::Filtered) {
+                    pending = pending.saturating_sub(1);
+                }
+                results.insert(port, new_state);
+            }
+            Ok(None) | Err(_) => break,
+        }
+    }
+
+    results
+}
+
+// gives each port a unique sequence number so we can match replies to the right request
+fn simple_seq(port: u16) -> u32 {
+    0x1337_0000u32 | (port as u32)
+}
+
+// finds our local IP address  (need it to build valid SYN packets)
+fn get_local_ipv4() -> Option<Ipv4Addr> {
+    for iface in pnet::datalink::interfaces() {
+        if iface.is_loopback() || !iface.is_up() {
+            continue;
+        }
+        for ip_net in &iface.ips {
+            if let IpAddr::V4(v4) = ip_net.ip() {
+                return Some(v4);
+            }
+        }
+    }
+    None
+}
+
+// connects to a TCP port and tries to read the service banner
 async fn probe_port(ip: IpAddr, port: u16, timeout_ms: u64) -> (PortState, Option<String>) {
     let addr = SocketAddr::new(ip, port);
 
@@ -319,6 +615,53 @@ async fn probe_port(ip: IpAddr, port: u16, timeout_ms: u64) -> (PortState, Optio
     }
 }
 
+// sends a UDP packet and reads the reply to figure out if the port is open or closed, or filtered
+async fn probe_port_udp(ip: IpAddr, port: u16, timeout_ms: u64) -> (PortState, Option<String>) {
+    let local: SocketAddr = match ip {
+        IpAddr::V4(_) => "0.0.0.0:0".parse().unwrap(),
+        IpAddr::V6(_) => "[::]:0".parse().unwrap(),
+    };
+
+    let socket = match tokio::net::UdpSocket::bind(local).await {
+        Ok(s) => s,
+        Err(_) => return (PortState::Filtered, None),
+    };
+
+    let dest = SocketAddr::new(ip, port);
+    if socket.connect(dest).await.is_err() {
+        return (PortState::Filtered, None);
+    }
+
+    let probe = udp_probe(port);
+    let _ = timeout(Duration::from_millis(timeout_ms), socket.send(probe)).await;
+
+    let mut buf = vec![0u8; 1024];
+    match timeout(Duration::from_millis(timeout_ms), socket.recv(&mut buf)).await {
+        Ok(Ok(n)) => {
+            let raw = String::from_utf8_lossy(&buf[..n]);
+            let line = raw.lines().next().map(|l| l.trim().to_string());
+            (PortState::Open, line.filter(|s| !s.is_empty()))
+        }
+        Ok(Err(e)) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
+            // ICMP port unreachable → closed
+            (PortState::Closed, None)
+        }
+        _ => (PortState::OpenFiltered, None),
+    }
+}
+
+// returns the right bytes to send to get a response from a UDP service
+fn udp_probe(port: u16) -> &'static [u8] {
+    match port {
+        
+        53 => b"\x00\x00\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x07version\x04bind\x00\x00\x10\x00\x03",
+       
+        161 => b"\x30\x26\x02\x01\x00\x04\x06public\xa0\x19\x02\x04\x00\x00\x00\x00\x02\x01\x00\x02\x01\x00\x30\x0b\x30\x09\x06\x05\x2b\x06\x01\x02\x01\x05\x00",
+        _ => b"\x00",
+    }
+}
+
+// reads the first line the server sends after connecting ( sends a HEAD request first for HTTP ports)
 async fn grab_banner(stream: &mut TcpStream, port: u16, timeout_ms: u64) -> Option<String> {
     if matches!(port, 80 | 8080 | 8000 | 8008 | 8888) {
         let req = b"HEAD / HTTP/1.0\r\n\r\n";
@@ -336,6 +679,7 @@ async fn grab_banner(stream: &mut TcpStream, port: u16, timeout_ms: u64) -> Opti
     }
 }
 
+// returns the service name for a port number (like "ssh" for 22)
 fn service_name(port: u16) -> &'static str {
     match port {
         20 => "ftp-data",
@@ -346,15 +690,19 @@ fn service_name(port: u16) -> &'static str {
         53 => "dns",
         67 => "dhcp",
         68 => "dhcp",
+        69 => "tftp",
         80 => "http",
         110 => "pop3",
         111 => "rpcbind",
         119 => "nntp",
         123 => "ntp",
         135 => "msrpc",
+        137 => "netbios-ns",
+        138 => "netbios-dgm",
         139 => "netbios-ssn",
         143 => "imap",
         161 => "snmp",
+        162 => "snmp-trap",
         179 => "bgp",
         389 => "ldap",
         443 => "https",
@@ -363,15 +711,24 @@ fn service_name(port: u16) -> &'static str {
         500 => "isakmp",
         514 => "syslog",
         515 => "printer",
+        520 => "rip",
         587 => "submission",
+        623 => "ipmi",
+        631 => "ipp",
         636 => "ldaps",
         993 => "imaps",
         995 => "pop3s",
+        1194 => "openvpn",
         1433 => "mssql",
+        1434 => "mssql-m",
         1521 => "oracle",
         1723 => "pptp",
+        1900 => "upnp",
         3306 => "mysql",
         3389 => "rdp",
+        4500 => "ike-nat",
+        5353 => "mdns",
+        5355 => "llmnr",
         5432 => "postgresql",
         5900 => "vnc",
         5901 => "vnc-1",
@@ -380,6 +737,7 @@ fn service_name(port: u16) -> &'static str {
         8443 => "https-alt",
         8888 => "http-alt",
         9200 => "elasticsearch",
+        10000 => "webmin",
         27017 => "mongodb",
         _ => "unknown",
     }
@@ -415,6 +773,21 @@ mod tests {
     #[test]
     fn top_1000_ports_count() {
         assert_eq!(TOP_1000_PORTS.len(), 1000);
+    }
+
+    #[test]
+    fn parse_cidr_32_returns_single_host() {
+        let targets = parse_targets("192.168.1.5/32").unwrap();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].to_string(), "192.168.1.5");
+    }
+
+    #[test]
+    fn parse_cidr_31_returns_both_addresses() {
+        let targets = parse_targets("192.168.1.4/31").unwrap();
+        assert_eq!(targets.len(), 2);
+        assert_eq!(targets[0].to_string(), "192.168.1.4");
+        assert_eq!(targets[1].to_string(), "192.168.1.5");
     }
 
     #[test]

@@ -3,7 +3,9 @@ use std::io::Write;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use http_fuzzer::{FuzzerArgs, run_fuzzer};
-use network_scanner::{PortInfo, ScanConfig, TOP_1000_PORTS, parse_ports, parse_targets, scan};
+use network_scanner::{
+    PortInfo, ScanConfig, ScanMode, TOP_1000_PORTS, TOP_UDP_PORTS, parse_ports, parse_targets, scan,
+};
 use tokio::sync::mpsc;
 
 #[derive(Parser)]
@@ -35,6 +37,18 @@ enum Commands {
 
         #[arg(long = "no-ping")]
         no_ping: bool,
+
+        // exclude IPs from scan
+        #[arg(long)]
+        exclude: Option<String>,
+
+        // SYN scan — requires root
+        #[arg(long = "sS", name = "sS")]
+        syn: bool,
+
+        // UDP scan
+        #[arg(long = "sU", name = "sU")]
+        udp: bool,
     },
 }
 
@@ -76,6 +90,9 @@ async fn main() -> Result<()> {
             top_ports,
             timing,
             no_ping,
+            exclude,
+            syn,
+            udp,
         } => {
             if timing >= 4 {
                 println!(
@@ -93,20 +110,50 @@ async fn main() -> Result<()> {
                 }
             }
 
+            let mode = if syn {
+                ScanMode::Syn
+            } else if udp {
+                ScanMode::Udp
+            } else {
+                ScanMode::TcpConnect
+            };
+
+            let default_ports: &[u16] = if udp { TOP_UDP_PORTS } else { TOP_1000_PORTS };
+
             let port_list: Vec<u16> = if let Some(p) = ports {
                 parse_ports(&p)?
             } else if let Some(n) = top_ports {
-                TOP_1000_PORTS.iter().take(n).copied().collect()
+                default_ports.iter().take(n).copied().collect()
             } else {
-                TOP_1000_PORTS.to_vec()
+                default_ports.to_vec()
             };
 
             let (concurrency, timeout_ms) = timing_config(timing);
-            let targets = parse_targets(&target)?;
+            let mut targets = parse_targets(&target)?;
+            let total_before = targets.len();
+
+            // filter excluded IPs
+            if let Some(ex) = exclude {
+                let excluded: std::collections::HashSet<_> =
+                    parse_targets(&ex)?.into_iter().collect();
+                targets.retain(|ip| !excluded.contains(ip));
+                let removed = total_before - targets.len();
+                if removed > 0 {
+                    println!("[*] {} hôte(s) exclus", removed);
+                }
+            }
+
             let total = targets.len();
+
+            let mode_label = match mode {
+                ScanMode::TcpConnect => "TCP Connect",
+                ScanMode::Syn => "SYN (raw)",
+                ScanMode::Udp => "UDP",
+            };
 
             println!("--- [ Network Scanner ] ---");
             println!("Target  : {}", target);
+            println!("Mode    : {}", mode_label);
             println!("Hosts   : {}", total);
             println!("Ports   : {}", port_list.len());
             println!("Timing  : T{}", timing);
@@ -119,13 +166,14 @@ async fn main() -> Result<()> {
                 timeout_ms,
                 skip_ping: no_ping,
                 ports: port_list,
+                mode,
             };
 
             let (tx, mut rx) = mpsc::channel::<(String, PortInfo)>(256);
 
             // Affichage en-tête tableau
             println!(
-                "{:<10} {:<10} {:<16} {}",
+                "{:<10} {:<14} {:<16} {}",
                 "PORT", "STATE", "SERVICE", "BANNER"
             );
             println!("{}", "-".repeat(70));
@@ -134,7 +182,7 @@ async fn main() -> Result<()> {
                 while let Some((_ip, info)) = rx.recv().await {
                     let banner = info.banner.as_deref().unwrap_or("");
                     println!(
-                        "{:<10} {:<10} {:<16} {}",
+                        "{:<10} {:<14} {:<16} {}",
                         format!("{}/tcp", info.port),
                         info.state.to_string(),
                         info.service,
@@ -148,13 +196,17 @@ async fn main() -> Result<()> {
 
             println!("\n--- [ Résumé ] ---");
             for result in &results {
-                println!(
+                let mut line = format!(
                     "{} : {} open, {} closed, {} filtered",
                     result.ip,
                     result.open_ports.len(),
                     result.closed_count,
                     result.filtered_count,
                 );
+                if result.open_filtered_count > 0 {
+                    line.push_str(&format!(", {} open|filtered", result.open_filtered_count));
+                }
+                println!("{}", line);
             }
         }
     }
