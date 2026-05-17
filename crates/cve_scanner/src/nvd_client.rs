@@ -1,93 +1,131 @@
-use crate::models::Vulnerability;
-use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use crate::models::Service;
+use anyhow::{Context, Result};
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
-pub struct NvdCveResponse { pub result: Option<NvdResult> }
+// ---- Structures de désérialisation pour l'API NVD v2 ----
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
-pub struct NvdResult {
-    #[serde(rename = "CVE_Items")]
-    pub cve_items: Option<Vec<CveItem>>,
+#[derive(Deserialize, Debug)]
+pub struct NvdV2Response {
+    pub vulnerabilities: Option<Vec<NistVulnerability>>,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
-pub struct CveItem { pub cve: CveData, pub impact: Option<Impact> }
-
-#[derive(Debug, Deserialize, Serialize, Clone)]
-pub struct CveData {
-    #[serde(rename = "ID")] pub id: String,
-    pub description: Option<DescriptionData>,
+#[derive(Deserialize, Debug)]
+pub struct NistVulnerability {
+    pub cve: CveDetails,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
-pub struct DescriptionData {
-    pub description_data: Option<Vec<DescriptionItem>>,
+#[derive(Deserialize, Debug, Serialize, Clone)]
+pub struct CveDetails {
+    pub id: String,
+    pub descriptions: Vec<CveDescription>,
+    pub metrics: Option<CveMetrics>,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
-pub struct DescriptionItem { pub value: String }
-
-#[derive(Debug, Deserialize, Serialize, Clone)]
-pub struct Impact {
-    #[serde(rename = "baseMetricV3")] pub base_metric_v3: Option<BaseMetricV3>,
-    #[serde(rename = "baseMetricV2")] pub base_metric_v2: Option<BaseMetricV2>,
+#[derive(Deserialize, Debug, Serialize, Clone)]
+pub struct CveDescription {
+    pub lang: String,
+    pub value: String,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
-pub struct BaseMetricV3 { #[serde(rename = "cvssV3")] pub cvss_v3: Option<CvssV3> }
-
-#[derive(Debug, Deserialize, Serialize, Clone)]
-pub struct CvssV3 {
-    #[serde(rename = "baseSeverity")] pub base_severity: Option<String>,
-    #[serde(rename = "baseScore")] pub base_score: f32,
+#[derive(Deserialize, Debug, Serialize, Clone)]
+pub struct CveMetrics {
+    #[serde(rename = "cvssMetricV31")]
+    pub cvss_v31: Option<Vec<CvssMetricV31>>,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
-pub struct BaseMetricV2 { #[serde(rename = "cvssV2")] pub cvss_v2: Option<CvssV2> }
+#[derive(Deserialize, Debug, Serialize, Clone)]
+pub struct CvssMetricV31 {
+    #[serde(rename = "cvssData")]
+    pub cvss_data: CvssData,
+}
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
-pub struct CvssV2 { #[serde(rename = "baseScore")] pub base_score: f32 }
+#[derive(Deserialize, Debug, Serialize, Clone)]
+pub struct CvssData {
+    #[serde(rename = "baseScore")]
+    pub base_score: f32,
+    #[serde(rename = "baseSeverity")]
+    pub base_severity: String,
+}
 
-pub struct NvdClient { client: reqwest::Client }
+// ---- Structure du rapport final généré ----
+
+#[derive(Serialize, Debug)]
+pub struct VulnerabilityReport {
+    pub service_name: String,
+    pub version: String,
+    pub cves: Vec<CveDetails>,
+}
+
+pub struct NvdClient {
+    client: reqwest::Client,
+}
 
 impl NvdClient {
-    pub fn new() -> Self { Self { client: reqwest::Client::new() } }
-
-    pub async fn fetch_cve_details(&self, cve_id: &str) -> Result<Option<(String, f32)>> {
-        let url = format!("https://services.nvd.nist.gov/rest/json/cves/1.0?keyword={}", cve_id);
-        tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
-
-        let response = self.client.get(&url).send().await.context(format!("Failed to fetch from NVD: {}", cve_id))?;
-        if !response.status().is_success() { anyhow::bail!("NVD API error : {}", cve_id); }
-
-        let nvd_response: NvdCveResponse = response.json().await.context("Failed to parse NVD response")?;
-
-        if let Some(result) = nvd_response.result {
-            if let Some(items) = result.cve_items {
-                if let Some(item) = items.first() {
-                    let description = item.cve.description.as_ref()
-                        .and_then(|d| d.description_data.as_ref())
-                        .and_then(|dd| dd.first())
-                        .map(|di| di.value.clone())
-                        .unwrap_or_else(|| "No description available".to_string());
-
-                    let score = item.impact.as_ref().and_then(|i| i.base_metric_v3.as_ref()).and_then(|b| b.cvss_v3.as_ref()).map(|c| c.base_score)
-                        .or_else(|| item.impact.as_ref().and_then(|i| i.base_metric_v2.as_ref()).and_then(|b| b.cvss_v2.as_ref()).map(|c| c.base_score))
-                        .unwrap_or(0.0);
-
-                    return Ok(Some((description, score)));
-                }
-            }
+    pub fn new() -> Self {
+        Self {
+            client: reqwest::Client::builder()
+                .user_agent("Rust-Vuln-Scanner/1.0")
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new()),
         }
-        Ok(None)
     }
 
-    pub async fn enrich_vulnerability(&self, vuln: &mut Vulnerability) -> Result<()> {
-        if let Ok(Some((description, score))) = self.fetch_cve_details(&vuln.cve_id).await {
-            vuln.description = description;
-            vuln.cvss_score = score;
+    /// Nouvelle méthode : Recherche des CVEs par mot-clé (Produit + Version) via API v2
+    pub async fn scan_services_for_cves(&self, services: Vec<Service>, api_key: Option<&str>) -> Vec<VulnerabilityReport> {
+        let mut reports = Vec::new();
+        println!("\n[+] Lancement de la recherche de CVE sur la base NIST (Async)...");
+
+        for service in services {
+            if service.version == "unknown" || service.version.is_empty() {
+                continue;
+            }
+
+            println!("[-] Recherche pour : {} {}", service.name, service.version);
+            let keyword = format!("{} {}", service.name, service.version);
+            let url = "https://services.nvd.nist.gov/rest/json/cves/2.0";
+
+            let mut req = self.client.get(url).query(&[("keywordSearch", &keyword)]);
+            if let Some(key) = api_key {
+                req = req.header("apiKey", key);
+            }
+
+            match req.send().await {
+                Ok(response) => {
+                    if response.status().is_success() {
+                        if let Ok(nist_data) = response.json::<NvdV2Response>().await {
+                            let mut discovered_cves = Vec::new();
+                            if let Some(vulns) = nist_data.vulnerabilities {
+                                for vuln in vulns {
+                                    discovered_cves.push(vuln.cve);
+                                }
+                            }
+
+                            if !discovered_cves.is_empty() {
+                                println!("    ↳ [!] {} CVE(s) trouvée(s) !", discovered_cves.len());
+                                reports.push(VulnerabilityReport {
+                                    service_name: service.name,
+                                    version: service.version,
+                                    cves: discovered_cves,
+                                });
+                            } else {
+                                println!("    ↳ [~] Aucune CVE trouvée.");
+                            }
+                        }
+                    } else if response.status().as_u16() == 429 {
+                        println!("    ↳ [x] Erreur 429 : Rate limit. Temporisation...");
+                        tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+                    } else {
+                        println!("    ↳ [x] Erreur API NVD : Code {}", response.status());
+                    }
+                }
+                Err(e) => println!("    ↳ [x] Erreur réseau : {}", e),
+            }
+
+            // Rate limiting respectueux (6s sans clé, 1s avec clé)
+            let delay = if api_key.is_some() { 1 } else { 6 };
+            tokio::time::sleep(tokio::time::Duration::from_secs(delay)).await;
         }
-        Ok(())
+
+        reports
     }
 }
