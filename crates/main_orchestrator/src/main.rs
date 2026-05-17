@@ -4,7 +4,8 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use http_fuzzer::{FuzzerArgs, run_fuzzer};
 use network_scanner::{
-    PortInfo, ScanConfig, ScanMode, TOP_1000_PORTS, TOP_UDP_PORTS, parse_ports, parse_targets, scan,
+    PortInfo, ScanConfig, ScanMode, TOP_1000_PORTS, TOP_UDP_PORTS, export_json, parse_ports,
+    parse_targets, scan,
 };
 use tokio::sync::mpsc;
 
@@ -49,6 +50,10 @@ enum Commands {
         // UDP scan
         #[arg(long = "sU", name = "sU")]
         udp: bool,
+
+        // save results to a JSON file
+        #[arg(short = 'o', long)]
+        output: Option<String>,
     },
 }
 
@@ -93,6 +98,7 @@ async fn main() -> Result<()> {
             exclude,
             syn,
             udp,
+            output,
         } => {
             if timing >= 4 {
                 println!(
@@ -207,6 +213,11 @@ async fn main() -> Result<()> {
                     line.push_str(&format!(", {} open|filtered", result.open_filtered_count));
                 }
                 println!("{}", line);
+            }
+
+            if let Some(path) = output {
+                export_json(&results, &path)?;
+                println!("\n[+] Résultats exportés vers {}", path);
             }
         }
     }

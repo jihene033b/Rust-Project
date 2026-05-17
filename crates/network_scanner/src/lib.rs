@@ -743,6 +743,41 @@ fn service_name(port: u16) -> &'static str {
     }
 }
 
+// exports scan results to a JSON file 
+// we include only hosts with at least one open port 
+pub fn export_json(results: &[ScanResult], path: &str) -> Result<()> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[derive(Serialize)]
+    struct Report<'a> {
+        scanned_at: u64,
+        total_hosts_scanned: usize,
+        hosts_with_findings: usize,
+        results: Vec<&'a ScanResult>,
+    }
+
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let interesting: Vec<&ScanResult> = results
+        .iter()
+        .filter(|r| !r.open_ports.is_empty())
+        .collect();
+
+    let report = Report {
+        scanned_at: ts,
+        total_hosts_scanned: results.len(),
+        hosts_with_findings: interesting.len(),
+        results: interesting,
+    };
+
+    let json = serde_json::to_string_pretty(&report)?;
+    std::fs::write(path, json)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
